@@ -1,0 +1,558 @@
+# PromptOpt Co-Pilot - Complete Docker Compose Configuration
+# Version: 3.8 (supports Docker Engine 19.03.0+)
+# Purpose: Orchestrates complete application stack for offline prompt optimization
+version: '3.8'
+
+# ============================================================================
+# NETWORKS CONFIGURATION
+# ============================================================================
+networks:
+  promptopt-network:
+    driver: bridge
+    name: promptopt-internal
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+          gateway: 172.20.0.1
+    driver_opts:
+      com.docker.network.bridge.name: promptopt-br0
+
+# ============================================================================
+# VOLUMES CONFIGURATION
+# ============================================================================
+volumes:
+  # Persistent storage for SQLite database
+  promptopt-database:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/database
+  
+  # Model storage for GGUF files and ML models
+  promptopt-models:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/models
+  
+  # Application logs aggregation
+  promptopt-logs:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/logs
+  
+  # Configuration files and secrets
+  promptopt-config:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./config
+  
+  # Backup storage for disaster recovery
+  promptopt-backups:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/backups
+  
+  # Frontend build artifacts and cache
+  promptopt-frontend-cache:
+    driver: local
+
+# ============================================================================
+# SERVICES CONFIGURATION
+# ============================================================================
+services:
+  
+  # --------------------------------------------------------------------------
+  # MODEL STORAGE SERVICE
+  # Purpose: Manages GGUF model files, downloads, and validation
+  # --------------------------------------------------------------------------
+  model-storage:
+    image: alpine:3.18
+    container_name: promptopt-model-storage
+    networks:
+      - promptopt-network
+    volumes:
+      - promptopt-models:/models
+      - promptopt-config:/config:ro
+      - promptopt-logs:/logs
+    environment:
+      - MODEL_STORAGE_PATH=/models
+      - CONFIG_PATH=/config
+      - LOG_LEVEL=INFO
+    command: >
+      sh -c "
+        echo 'Initializing model storage...' &&
+        mkdir -p /models/gguf /models/embeddings /models/cache &&
+        chown -R 1000:1000 /models &&
+        chmod -R 755 /models &&
+        echo 'Model storage initialized successfully' &&
+        tail -f /dev/null
+      "
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "test", "-d", "/models"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    labels:
+      - "promptopt.service=model-storage"
+      - "promptopt.description=Model storage and management service"
+
+  # --------------------------------------------------------------------------
+  # DATABASE SERVICE
+  # Purpose: SQLite database with persistence and backup support
+  # --------------------------------------------------------------------------
+  database:
+    image: alpine:3.18
+    container_name: promptopt-database
+    networks:
+      - promptopt-network
+    volumes:
+      - promptopt-database:/database
+      - promptopt-backups:/backups
+      - promptopt-logs:/logs
+    environment:
+      - DATABASE_PATH=/database
+      - BACKUP_PATH=/backups
+      - BACKUP_INTERVAL=3600  # 1 hour
+    command: >
+      sh -c "
+        echo 'Initializing database storage...' &&
+        mkdir -p /database /backups &&
+        chown -R 1000:1000 /database /backups &&
+        chmod -R 755 /database /backups &&
+        echo 'Database storage initialized successfully' &&
+        # Setup backup cron job
+        echo '0 */6 * * * cp /database/*.db /backups/backup-$(date +%Y%m%d-%H%M%S).db' | crontab - &&
+        crond -f
+      "
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "test", "-d", "/database"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    labels:
+      - "promptopt.service=database"
+      - "promptopt.description=SQLite database with automated backups"
+
+  # --------------------------------------------------------------------------
+  # BACKEND SERVICE
+  # Purpose: FastAPI application with LLM inference capabilities
+  # --------------------------------------------------------------------------
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        - PYTHON_VERSION=3.9
+        - REQUIREMENTS_FILE=requirements.txt
+    image: promptopt/backend:latest
+    container_name: promptopt-backend
+    networks:
+      - promptopt-network
+    ports:
+      - "8000:8000"  # API endpoint
+    volumes:
+      - promptopt-models:/app/models:ro
+      - promptopt-database:/app/database
+      - promptopt-logs:/app/logs
+      - promptopt-config:/app/config:ro
+      - ./backend:/app:ro  # Development mode - remove for production
+    environment:
+      # Application Configuration
+      - FASTAPI_ENV=${ENVIRONMENT:-production}
+      - DEBUG=${DEBUG:-false}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+      
+      # Database Configuration
+      - DATABASE_URL=sqlite:///database/promptopt.db
+      - DATABASE_BACKUP_ENABLED=true
+      - DATABASE_BACKUP_INTERVAL=21600  # 6 hours
+      
+      # Model Configuration
+      - MODEL_PATH=/app/models
+      - MODEL_CACHE_SIZE=2GB
+      - MAX_MODEL_MEMORY=6GB
+      - LLAMA_CPP_THREADS=${LLAMA_CPP_THREADS:-4}
+      - LLAMA_CPP_N_CTX=${LLAMA_CPP_N_CTX:-2048}
+      
+      # Performance Configuration
+      - WORKERS=${BACKEND_WORKERS:-1}
+      - MAX_CONCURRENT_REQUESTS=10
+      - REQUEST_TIMEOUT=300
+      - KEEPALIVE_TIMEOUT=65
+      
+      # Security Configuration
+      - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
+      - ACCESS_TOKEN_EXPIRE_MINUTES=30
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000}
+      
+      # Monitoring Configuration
+      - ENABLE_METRICS=true
+      - METRICS_PORT=8001
+      - HEALTH_CHECK_INTERVAL=30
+    depends_on:
+      model-storage:
+        condition: service_healthy
+      database:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 8G
+        reservations:
+          cpus: '2.0'
+          memory: 4G
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      stack: 67108864
+    labels:
+      - "promptopt.service=backend"
+      - "promptopt.description=FastAPI backend with LLM inference"
+      - "traefik.enable=true"
+      - "traefik.http.routers.backend.rule=PathPrefix(/api)"
+
+  # --------------------------------------------------------------------------
+  # FRONTEND SERVICE
+  # Purpose: Next.js application with optimized static serving
+  # --------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        - NODE_VERSION=18
+        - BUILD_MODE=${BUILD_MODE:-production}
+    image: promptopt/frontend:latest
+    container_name: promptopt-frontend
+    networks:
+      - promptopt-network
+    ports:
+      - "3000:3000"  # Web interface
+    volumes:
+      - promptopt-frontend-cache:/app/.next/cache
+      - promptopt-logs:/app/logs
+      - ./frontend:/app:ro  # Development mode - remove for production
+    environment:
+      # Application Configuration
+      - NODE_ENV=${NODE_ENV:-production}
+      - NEXT_TELEMETRY_DISABLED=1
+      - PORT=3000
+      
+      # API Configuration
+      - NEXT_PUBLIC_API_URL=${API_URL:-http://backend:8000}
+      - NEXT_PUBLIC_WS_URL=${WS_URL:-ws://backend:8000/ws}
+      - API_TIMEOUT=30000
+      
+      # Performance Configuration
+      - NEXT_SHARP=1
+      - NEXT_OPTIMIZE_FONTS=true
+      - NEXT_OPTIMIZE_IMAGES=true
+      
+      # Security Configuration
+      - NEXT_PUBLIC_CSP_ENABLED=true
+      - NEXT_PUBLIC_SECURE_HEADERS=true
+      
+      # Development Configuration (remove for production)
+      - NEXT_DEV_OVERLAY=true
+      - FAST_REFRESH=true
+    depends_on:
+      - backend
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    labels:
+      - "promptopt.service=frontend"
+      - "promptopt.description=Next.js frontend application"
+      - "traefik.enable=true"
+      - "traefik.http.routers.frontend.rule=PathPrefix(/)"
+
+  # --------------------------------------------------------------------------
+  # MODEL DOWNLOADER SERVICE
+  # Purpose: Downloads and validates ML models on startup
+  # --------------------------------------------------------------------------
+  model-downloader:
+    image: python:3.9-alpine
+    container_name: promptopt-model-downloader
+    networks:
+      - promptopt-network
+    volumes:
+      - promptopt-models:/models
+      - promptopt-config:/config:ro
+      - promptopt-logs:/logs
+      - ./scripts:/scripts:ro
+    environment:
+      - MODEL_LIST_FILE=/config/models.json
+      - MODEL_STORAGE_PATH=/models
+      - DOWNLOAD_TIMEOUT=3600
+      - VERIFY_CHECKSUMS=true
+      - LOG_LEVEL=INFO
+    command: >
+      sh -c "
+        pip install requests tqdm &&
+        python /scripts/download_models.py &&
+        echo 'Model download completed'
+      "
+    depends_on:
+      model-storage:
+        condition: service_healthy
+    restart: "no"  # Run once
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+    labels:
+      - "promptopt.service=model-downloader"
+      - "promptopt.description=Automated model downloading service"
+
+  # --------------------------------------------------------------------------
+  # LOG AGGREGATOR SERVICE
+  # Purpose: Centralized logging and log rotation
+  # --------------------------------------------------------------------------
+  log-aggregator:
+    image: fluent/fluentd:v1.16-1
+    container_name: promptopt-logs
+    networks:
+      - promptopt-network
+    ports:
+      - "24224:24224"  # Fluentd forward protocol
+    volumes:
+      - promptopt-logs:/fluentd/log
+      - ./config/fluentd:/fluentd/etc:ro
+    environment:
+      - FLUENTD_CONF=fluent.conf
+      - FLUENTD_OPT=-v
+    depends_on:
+      - model-storage
+      - database
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:24220/api/plugins.json"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+    labels:
+      - "promptopt.service=log-aggregator"
+      - "promptopt.description=Centralized logging service"
+
+  # --------------------------------------------------------------------------
+  # MONITORING SERVICE
+  # Purpose: Health monitoring and metrics collection
+  # --------------------------------------------------------------------------
+  monitoring:
+    image: prom/prometheus:v2.45.0
+    container_name: promptopt-monitoring
+    networks:
+      - promptopt-network
+    ports:
+      - "9090:9090"  # Prometheus UI
+    volumes:
+      - ./config/prometheus:/etc/prometheus:ro
+      - promptopt-logs:/prometheus/data
+    environment:
+      - PROMETHEUS_RETENTION_TIME=7d
+      - PROMETHEUS_RETENTION_SIZE=1GB
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus/data'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=7d'
+      - '--storage.tsdb.retention.size=1GB'
+      - '--web.enable-lifecycle'
+    depends_on:
+      - backend
+      - frontend
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+    labels:
+      - "promptopt.service=monitoring"
+      - "promptopt.description=Prometheus monitoring service"
+
+# ============================================================================
+# PRODUCTION OVERRIDES
+# Use with: docker-compose -f docker-compose.yml -f docker-compose.prod.yml up
+# ============================================================================
+
+---
+# docker-compose.prod.yml (separate file)
+# Production-specific overrides for enhanced security and performance
+version: '3.8'
+
+services:
+  backend:
+    volumes:
+      # Remove development bind mount
+      - promptopt-models:/app/models:ro
+      - promptopt-database:/app/database
+      - promptopt-logs:/app/logs
+      - promptopt-config:/app/config:ro
+    environment:
+      - FASTAPI_ENV=production
+      - DEBUG=false
+      - LOG_LEVEL=WARNING
+      - WORKERS=4
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '6.0'
+          memory: 12G
+        reservations:
+          cpus: '4.0'
+          memory: 8G
+
+  frontend:
+    volumes:
+      # Remove development bind mount
+      - promptopt-frontend-cache:/app/.next/cache
+      - promptopt-logs:/app/logs
+    environment:
+      - NODE_ENV=production
+      - NEXT_DEV_OVERLAY=false
+      - FAST_REFRESH=false
+    deploy:
+      replicas: 2
+
+# ============================================================================
+# DEVELOPMENT OVERRIDES  
+# Use with: docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
+# ============================================================================
+
+---
+# docker-compose.dev.yml (separate file)
+# Development-specific configurations with hot reload and debugging
+version: '3.8'
+
+services:
+  backend:
+    environment:
+      - FASTAPI_ENV=development
+      - DEBUG=true
+      - LOG_LEVEL=DEBUG
+      - WORKERS=1
+    ports:
+      - "8000:8000"
+      - "8001:8001"  # Metrics endpoint
+      - "5678:5678"  # Debug port
+    command: ["python", "-m", "debugpy", "--listen", "0.0.0.0:5678", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+
+  frontend:
+    environment:
+      - NODE_ENV=development
+      - NEXT_DEV_OVERLAY=true
+      - FAST_REFRESH=true
+    ports:
+      - "3000:3000"
+      - "3001:3001"  # Next.js dev server
+    command: ["npm", "run", "dev"]
+
+  # Development database browser
+  db-browser:
+    image: coleifer/sqlite-web
+    container_name: promptopt-db-browser
+    networks:
+      - promptopt-network
+    ports:
+      - "8080:8080"
+    volumes:
+      - promptopt-database:/database:ro
+    environment:
+      - SQLITE_DATABASE=/database/promptopt.db
+    depends_on:
+      - database
+
+# ============================================================================
+# USAGE INSTRUCTIONS
+# ============================================================================
+
+# Production deployment:
+# docker-compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+
+# Development environment:
+# docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
+
+# Scale services:
+# docker-compose up --scale backend=3 --scale frontend=2
+
+# View logs:
+# docker-compose logs -f [service-name]
+
+# Health checks:
+# docker-compose ps
+# curl http://localhost:8000/health
+# curl http://localhost:3000/api/health
+
+# Backup database:
+# docker-compose exec database sh -c "cp /database/*.db /backups/manual-backup-$(date +%Y%m%d-%H%M%S).db"
+
+# Clean up:
+# docker-compose down -v --remove-orphans
+
+# ============================================================================
+# ENVIRONMENT VARIABLES
+# Create .env file with the following variables:
+# ============================================================================
+
+# ENVIRONMENT=production
+# DEBUG=false
+# LOG_LEVEL=INFO
+# SECRET_KEY=your-very-secure-secret-key-here
+# CORS_ORIGINS=http://localhost:3000,https://yourdomain.com
+# API_URL=http://localhost:8000
+# WS_URL=ws://localhost:8000/ws
+# BACKEND_WORKERS=4
+# LLAMA_CPP_THREADS=8
+# LLAMA_CPP_N_CTX=4096
+# BUILD_MODE=production
+# NODE_ENV=production
