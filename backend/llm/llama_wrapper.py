@@ -4,7 +4,7 @@ PromptOpt Co-Pilot - Llama.cpp Wrapper
 A comprehensive wrapper for llama.cpp providing OpenAI-compatible REST interface
 for prompt optimization using local GGUF models.
 
-Author: PromptOpt Co-Pilot Development Team
+Author: Santhosh Kumar
 License: MIT
 """
 

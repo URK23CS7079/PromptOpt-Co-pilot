@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Union
 import json
+import uuid
 
 from sqlalchemy import (
     create_engine, 
@@ -62,7 +63,7 @@ class ValidationError(DatabaseError):
 # Database Models
 class Prompt(Base):
     """
-    Base prompt model storing original prompts and metadata.
+    Base prompt model storing original prompts and meta.
     
     Attributes:
         id: Primary key
@@ -76,8 +77,10 @@ class Prompt(Base):
     """
     __tablename__ = 'prompts'
     
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    name = Column(String(255), nullable=False)
     content = Column(Text, nullable=False)
+    version = Column(Integer, default=1, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
     tags = Column(JSON, default=list)
@@ -117,7 +120,7 @@ class PromptVariant(Base):
     """
     __tablename__ = 'prompt_variants'
     
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     prompt_id = Column(Integer, ForeignKey('prompts.id'), nullable=False)
     content = Column(Text, nullable=False)
     generation_method = Column(String(50), nullable=False, default='manual')
@@ -154,18 +157,18 @@ class Dataset(Base):
         created_at: Timestamp when dataset was created
         description: Optional description of the dataset
         format_type: Type of dataset format (json, csv, etc.)
-        metadata: Additional dataset metadata
+        dataset_metadata: Additional dataset metadata
     """
     __tablename__ = 'datasets'
     
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     name = Column(String(200), nullable=False, unique=True)
     file_path = Column(String(500), nullable=False)
     samples_count = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     description = Column(Text, nullable=True)
     format_type = Column(String(20), nullable=False, default='json')
-    metadata = Column(JSON, default=dict)
+    dataset_metadata  = Column(JSON, default=dict)
     
     # Relationships
     evaluation_runs = relationship("EvaluationRun", back_populates="dataset")
@@ -197,7 +200,7 @@ class EvaluationRun(Base):
     """
     __tablename__ = 'evaluation_runs'
     
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     prompt_id = Column(Integer, ForeignKey('prompts.id'), nullable=False)
     dataset_id = Column(Integer, ForeignKey('datasets.id'), nullable=False)
     metrics = Column(JSON, nullable=False)
@@ -243,7 +246,7 @@ class EvaluationResult(Base):
     """
     __tablename__ = 'evaluation_results'
     
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     run_id = Column(Integer, ForeignKey('evaluation_runs.id'), nullable=False)
     variant_id = Column(Integer, ForeignKey('prompt_variants.id'), nullable=False)
     score = Column(Float, nullable=False)
@@ -289,7 +292,7 @@ class OptimizationSession(Base):
     """
     __tablename__ = 'optimization_sessions'
     
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     base_prompt_id = Column(Integer, ForeignKey('prompts.id'), nullable=False)
     best_variant_id = Column(Integer, ForeignKey('prompt_variants.id'), nullable=True)
     settings = Column(JSON, nullable=False)
@@ -540,7 +543,7 @@ def init_database(settings: Settings) -> DatabaseManager:
     try:
         # Extract database path from URL (assuming sqlite:///path format)
         db_path = settings.database_url.replace('sqlite:///', '')
-        
+        logger.info(f"Initializing database with URL: {settings.database_url}")
         # Initialize database manager
         db_manager = DatabaseManager(db_path, echo=False)
         

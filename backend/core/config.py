@@ -93,7 +93,7 @@ class Settings(BaseSettings):
     # =====================================
     
     database_url: str = Field(
-        default="sqlite:///promptopt.db",
+        default=f"sqlite:///{Path.home()}/.promptopt/promptopt.db",
         description="SQLite database URL (relative to data_dir)"
     )
     
